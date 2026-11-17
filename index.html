@@ -236,7 +236,7 @@
     lead: 15, sound: 'chime', ttsText: DEFAULT_TTS,
     isMonitoring: false, simMode: 'real',
     weatherOk: false, slots: [], rainStartTime: null, isRainingNow: false,
-    suppressUntil: 0, alarmTimer: null, rec: null, loading: false, lastError: ''
+    suppressUntil: 0, alarmTimer: null, rec: null, loading: false, lastError: '', horizon: 120
   };
 
   function save() {
@@ -667,6 +667,78 @@
   // ==========================================
   // 天気データ
   // ==========================================
+  // ---- 気象庁 高解像度降水ナウキャスト（地図タイルの色から、その地点の雨を読み取る）----
+  const JMA_BASE = 'https://www.jma.go.jp/bosai/jmatile/data/nowc/';
+  const RAIN_COLORS = [[242,242,255,0.5],[160,210,255,3],[33,140,255,7],[0,65,255,15],[255,217,0,25],[255,153,0,40],[255,40,0,65],[180,0,104,90]];
+  function colorToMm(r, g, b, a) {
+    if (a < 30) return 0;
+    let best = 0.5, bd = Infinity;
+    for (const c of RAIN_COLORS) {
+      const d = (r - c[0]) ** 2 + (g - c[1]) ** 2 + (b - c[2]) ** 2;
+      if (d < bd) { bd = d; best = c[3]; }
+    }
+    return best;
+  }
+  function lonLatToTile(lat, lon, z) {
+    const n = Math.pow(2, z), xf = (lon + 180) / 360 * n, la = lat * Math.PI / 180;
+    const yf = (1 - Math.log(Math.tan(la) + 1 / Math.cos(la)) / Math.PI) / 2 * n;
+    return { x: Math.floor(xf), y: Math.floor(yf), px: (xf - Math.floor(xf)) * 256, py: (yf - Math.floor(yf)) * 256 };
+  }
+  function loadTileImage(url) {
+    return new Promise((resolve, reject) => {
+      const im = new Image(); im.crossOrigin = 'anonymous';
+      const t = setTimeout(() => reject(new Error('tile timeout')), 8000);
+      im.onload = () => { clearTimeout(t); resolve(im); };
+      im.onerror = () => { clearTimeout(t); reject(new Error('tile error')); };
+      im.src = url;
+    });
+  }
+  async function jmaForecast(lat, lon) {
+    const [n1, n2] = await Promise.all([
+      fetchJson(JMA_BASE + 'targetTimes_N1.json', 8000),
+      fetchJson(JMA_BASE + 'targetTimes_N2.json', 8000)
+    ]);
+    const latest = n1.slice().sort((a, b) => b.validtime.localeCompare(a.validtime))[0];
+    const fc = n2.filter(x => x.validtime > latest.validtime).sort((a, b) => a.validtime.localeCompare(b.validtime)).slice(0, 12);
+    const list = [latest].concat(fc);
+    const tl = lonLatToTile(lat, lon, 10);
+    const x0 = Math.max(0, Math.min(249, Math.round(tl.px) - 3)), y0 = Math.max(0, Math.min(249, Math.round(tl.py) - 3));
+    let secErr = false;
+    const results = await Promise.all(list.map(async (f) => {
+      const t = jmaDate(f.validtime);
+      try {
+        const im = await loadTileImage(`${JMA_BASE}${f.basetime}/none/${f.validtime}/surf/hrpns/10/${tl.x}/${tl.y}.png`);
+        const c = document.createElement('canvas'); c.width = c.height = 256;
+        const g = c.getContext('2d', { willReadFrequently: true });
+        g.drawImage(im, 0, 0);
+        const d = g.getImageData(x0, y0, 7, 7).data;
+        let mm = 0;
+        for (let i = 0; i < d.length; i += 4) mm = Math.max(mm, colorToMm(d[i], d[i + 1], d[i + 2], d[i + 3]));
+        return { ok: true, time: t, mm };
+      } catch (e) {
+        if (e && e.name === 'SecurityError') secErr = true;
+        return { ok: false, time: t, mm: 0 };
+      }
+    }));
+    if (secErr) throw new Error('雨雲データの読み取りが制限されました');
+    if (results.filter(r => r.ok).length < Math.ceil(list.length / 2)) throw new Error('雨雲データを取得できません');
+    return results.map(r => ({ time: r.time, precip: r.mm }));
+  }
+  function applySlots(slots, horizonMin) {
+    state.slots = slots; state.weatherOk = true; state.horizon = horizonMin;
+    const TH = 0.1;
+    if (slots[0].precip >= TH) { state.isRainingNow = true; state.rainStartTime = new Date(Date.now()); }
+    else {
+      state.isRainingNow = false;
+      const f = slots.find(x => x.precip >= TH);
+      state.rainStartTime = f ? f.time : null;
+    }
+  }
+  function flattenErrors(e) {
+    if (e && e.errors) return e.errors.flatMap(flattenErrors);
+    return [e];
+  }
+
   function errText(e) {
     if (!e) return '不明';
     if (e.name === 'AbortError') return 'タイムアウト（応答が遅い）';
@@ -694,11 +766,13 @@
         return d;
       };
       try {
-        // 2つを同時に試し、先に成功したほうを使う
-        const data = await Promise.any(urls.map(attempt));
-        parseWeather(data);
+        // 気象庁の雨雲データ と Open-Meteo を同時に試し、先に成功したほうを使う
+        const jma = jmaForecast(state.lat, state.lon).then(slots => ({ kind: 'jma', slots }));
+        const om = Promise.any(urls.map(attempt)).then(data => ({ kind: 'om', data }));
+        const r = await Promise.any([jma, om]);
+        if (r.kind === 'jma') applySlots(r.slots, 60); else { parseWeather(r.data); state.horizon = 120; }
       } catch (e) {
-        const list = (e && e.errors) ? e.errors : [e];
+        const list = flattenErrors(e);
         state.lastError = list.map(errText).filter((v, i, a) => a.indexOf(v) === i).join(' / ');
         state.weatherOk = false; state.slots = []; state.rainStartTime = null; state.isRainingNow = false;
       }
@@ -835,7 +909,7 @@
 
     applyTheme('clear');
     $('status-pill').textContent = '☀️ 雨の心配なし';
-    $('status-title').textContent = '2時間は雨が降らない予報です';
+    $('status-title').textContent = (state.horizon === 60 ? '1時間' : '2時間') + 'は雨が降らない予報です';
     $('status-desc').textContent = '安心して干せます。ONのままなら、雨雲が近づいたらお知らせします。';
     setCount('雨まで', '<span class="text-base text-emerald-600">なし</span>');
   }
