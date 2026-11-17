@@ -211,7 +211,7 @@
     lead: 15, sound: 'chime', ttsText: DEFAULT_TTS,
     isMonitoring: false, simMode: 'real',
     weatherOk: false, slots: [], rainStartTime: null, isRainingNow: false,
-    suppressUntil: 0, alarmTimer: null, rec: null
+    suppressUntil: 0, alarmTimer: null, rec: null, loading: false, lastError: ''
   };
 
   function save() {
@@ -499,7 +499,11 @@
     const timer = setTimeout(() => c.abort(), ms);
     try {
       const r = await fetch(url, { signal: c.signal });
-      if (!r.ok) throw new Error('HTTP ' + r.status);
+      if (!r.ok) {
+        let reason = '';
+        try { reason = (await r.json()).reason || ''; } catch (e) {}
+        throw new Error('HTTP ' + r.status + (reason ? ': ' + reason : ''));
+      }
       return await r.json();
     } finally { clearTimeout(timer); }
   }
@@ -638,22 +642,42 @@
   // ==========================================
   // 天気データ
   // ==========================================
+  function errText(e) {
+    if (!e) return '不明';
+    if (e.name === 'AbortError') return 'タイムアウト（応答が遅い）';
+    const m = String(e.message || e);
+    if (/Failed to fetch|NetworkError|Load failed/i.test(m)) return '通信できません（ネット接続または制限）';
+    return m;
+  }
+
   async function fetchWeather() {
     if (!state.locSet && state.simMode === 'real') { evaluate(); return; }
     $('refresh-btn').textContent = '更新中…';
     if (state.simMode !== 'real') {
       generateSimulated(state.simMode);
     } else {
-      const q = `latitude=${state.lat}&longitude=${state.lon}&current=precipitation&hourly=precipitation&timezone=Asia%2FTokyo&timeformat=unixtime&forecast_days=2`;
+      state.loading = true; state.lastError = '';
+      evaluate();
+      const base = `latitude=${state.lat}&longitude=${state.lon}&timezone=Asia%2FTokyo&timeformat=unixtime&forecast_days=2`;
+      const urls = [
+        `https://api.open-meteo.com/v1/forecast?${base}&current=precipitation&hourly=precipitation`,
+        `https://api.open-meteo.com/v1/jma?${base}&hourly=precipitation`
+      ];
+      const attempt = async (u) => {
+        const d = await fetchJson(u, 12000);
+        if (!d || !d.hourly || !d.hourly.time) throw new Error('データの形式が違います');
+        return d;
+      };
       try {
-        parseWeather(await fetchJson('https://api.open-meteo.com/v1/jma?' + q));
-      } catch (e1) {
-        try {
-          parseWeather(await fetchJson('https://api.open-meteo.com/v1/forecast?' + q));
-        } catch (e2) {
-          state.weatherOk = false; state.slots = []; state.rainStartTime = null; state.isRainingNow = false;
-        }
+        // 2つを同時に試し、先に成功したほうを使う
+        const data = await Promise.any(urls.map(attempt));
+        parseWeather(data);
+      } catch (e) {
+        const list = (e && e.errors) ? e.errors : [e];
+        state.lastError = list.map(errText).filter((v, i, a) => a.indexOf(v) === i).join(' / ');
+        state.weatherOk = false; state.slots = []; state.rainStartTime = null; state.isRainingNow = false;
       }
+      state.loading = false;
     }
     $('refresh-btn').textContent = '最新の情報に更新';
     const d = new Date();
@@ -666,9 +690,9 @@
     const now = Date.now();
     const times = data.hourly.time.map(t => typeof t === 'number' ? t * 1000 : new Date(t).getTime());
     const prec = data.hourly.precipitation || [];
-    const cur = data.current && typeof data.current.precipitation === 'number' ? data.current.precipitation : (prec[0] || 0);
     let ci = 0;
     for (let i = 0; i < times.length; i++) { if (times[i] <= now) ci = i; else break; }
+    const cur = data.current && typeof data.current.precipitation === 'number' ? data.current.precipitation : (prec[ci] || 0);
     const slots = [];
     for (let s = 0; s < 8; s++) {
       const tm = now + s * 15 * 60000;
@@ -734,11 +758,20 @@
       return;
     }
 
+    if (state.loading && !state.weatherOk) {
+      applyTheme('approaching');
+      $('status-pill').textContent = '⏳ 確認中';
+      $('status-title').textContent = '天気を確認しています';
+      $('status-desc').textContent = '少しお待ちください（最大12秒ほど）。';
+      setCount('雨まで', '…');
+      return;
+    }
+
     if (!state.weatherOk) {
       applyTheme('error');
       $('status-pill').textContent = '⚠️ 取得できません';
       $('status-title').textContent = '天気情報を取得できません';
-      $('status-desc').textContent = '通信状態をご確認のうえ、「最新の情報に更新」を押してください。この間はアラームは鳴りません。';
+      $('status-desc').textContent = '通信状態をご確認のうえ、「最新の情報に更新」を押してください。この間はアラームは鳴りません。' + (state.lastError ? `（原因: ${state.lastError}）` : '');
       setCount('雨まで', '--');
       return;
     }
