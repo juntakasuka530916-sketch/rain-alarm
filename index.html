@@ -123,6 +123,10 @@
       <div class="text-xs text-slate-500">いまの場所</div>
       <div id="loc-name" class="font-bold">未設定</div>
       <div id="loc-acc" class="text-[11px] text-slate-400"></div>
+      <div id="loc-cands" class="hidden mt-2">
+        <div class="text-[11px] text-slate-500 mb-1">地名がちがうときは、近くの地名から選べます</div>
+        <div id="loc-cands-list" class="flex flex-wrap gap-1.5"></div>
+      </div>
     </div>
     <button id="gps-btn" type="button" class="w-full py-3 rounded-2xl bg-sky-600 text-white font-bold text-sm active:scale-95">📍 いまいる場所を自動で取得（GPS）</button>
     <div class="flex gap-2">
@@ -517,6 +521,7 @@
     save();
     updateMapLocation();
     fetchWeather();
+    showCandidates(state.lat, state.lon);
   }
 
   async function fetchJson(url, ms = 7000) {
@@ -586,6 +591,69 @@
       setTimeout(() => resolve(null), 6000);
     });
     return muniPromise;
+  }
+
+  // 国土地理院の1地点分の地名（失敗したら null）
+  async function gsiName(lat, lon) {
+    try {
+      const j = await fetchJson(`https://mreversegeocoder.gsi.go.jp/reverse-geocoder/LonLatToAddress?lat=${lat}&lon=${lon}`, 6000);
+      const r = j && j.results;
+      if (r && r.muniCd) {
+        const muni = await loadMuni();
+        const row = muni && (muni[String(Number(r.muniCd))] || muni[String(r.muniCd)]);
+        if (row) {
+          const p = String(row).split(',');
+          const town = r.lv01Nm && r.lv01Nm !== '－' ? r.lv01Nm : '';
+          return (p[1] || '') + (p[3] || '') + town;
+        }
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  // まわり約150mの地名も調べて、近くの地名の候補を出す（町の境目では隣の地名のことがあるため）
+  let candSeq = 0;
+  async function showCandidates(lat, lon) {
+    const box = $('loc-cands'), list = $('loc-cands-list');
+    if (!box || !list) return;
+    const seq = ++candSeq;
+    box.classList.add('hidden');
+    const d = 0.0015, dl = d / Math.cos(lat * Math.PI / 180);
+    const pts = [[0,0],[d,0],[-d,0],[0,dl],[0,-dl],[d,dl],[d,-dl],[-d,dl],[-d,-dl]];
+    const names = await Promise.all(pts.map(([a,b]) => gsiName(Number((lat + a).toFixed(6)), Number((lon + b).toFixed(6)))));
+    if (seq !== candSeq) return;
+    const uniq = [];
+    names.forEach(n => { if (n && !uniq.includes(n)) uniq.push(n); });
+    list.innerHTML = '';
+    uniq.slice(0, 5).forEach(n => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = n.replace(/^.{2,3}[都道府県]/, '');
+      b.title = n;
+      b.className = 'px-3 py-1.5 rounded-full text-xs font-bold border ' + (n === state.locName ? 'bg-sky-600 text-white border-sky-600' : 'bg-white text-slate-700 border-slate-300');
+      b.onclick = () => setLocName(n);
+      list.appendChild(b);
+    });
+    const own = document.createElement('button');
+    own.type = 'button'; own.textContent = '✎ 自分で入力';
+    own.className = 'px-3 py-1.5 rounded-full text-xs font-bold border bg-white text-slate-700 border-slate-300';
+    own.onclick = () => {
+      const v = prompt('地名を入力してください', state.locName === '未設定' ? '' : state.locName);
+      if (v && v.trim()) setLocName(v.trim());
+    };
+    list.appendChild(own);
+    box.classList.remove('hidden');
+  }
+  // 位置はそのままで、表示する地名だけを変える
+  function setLocName(name) {
+    state.locName = name;
+    $('loc-name').textContent = name;
+    save();
+    if ($('loc-cands-list')) [...$('loc-cands-list').children].forEach(b => {
+      const sel = b.title === name;
+      b.className = 'px-3 py-1.5 rounded-full text-xs font-bold border ' + (sel ? 'bg-sky-600 text-white border-sky-600' : 'bg-white text-slate-700 border-slate-300');
+    });
+    toast('地名を「' + name + '」にしました', 'success');
   }
 
   async function reverseName(lat, lon) {
@@ -1164,6 +1232,7 @@
     renderLeadChips(); renderSounds(); renderTtsChips(); renderSimButtons(); updateRecUI();
     initMap();
     fetchWeather();
+    if (state.locSet) showCandidates(state.lat, state.lon);
     if (!hadSaved) tryGPS(true); // 初回のみ、自動で現在地を取得
     setInterval(evaluate, 10000);
     setInterval(() => { if (state.simMode === 'real') fetchWeather(); }, 5 * 60000);
